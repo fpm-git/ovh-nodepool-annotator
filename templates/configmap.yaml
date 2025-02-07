@@ -1,0 +1,330 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "nodepool-annotater.fullname" . }}-configmap
+  namespace: {{ template "nodepool-annotater.namespace" . }}
+  labels:
+    {{- include "nodepool-annotater.labels" . | nindent 4 }}
+data:  
+  run.sh: |-
+    #!/bin/bash
+    while true
+    do
+      #check auth, this can fail sometimes. So if it does kill the container
+      command kubectl get node -l "nodepool=$NODEPOOL_NAME" --no-headers=true --ignore-not-found=true  >/dev/null 2>&1
+      if [ "$?" -eq 1 ]
+      then
+          #print the command that is causing an error
+          echo "There was a problem, killing container"
+          /sbin/killall5
+      fi
+
+      LIST=$(kubectl get node -l "nodepool=$NODEPOOL_NAME" --no-headers=true --ignore-not-found=true | awk '{print $1}')
+
+      if [ -z "$LIST" ]
+      then
+          sleep $TIME_TO_SLEEP
+      else
+      echo "---"
+      #for each node in the node pool
+      for NODE in $LIST; do
+          echo ""
+          nodeage=$(kubectl get node $NODE -o json | jq .metadata.labels.OVH_CREATIONTIME | tr -d '"')
+          
+          re='^[0-9]+$'
+          if ! [[ $nodeage =~ $re ]]
+          then #label not set, get time and set label
+              echo "label not set, call OVH"
+              Response=$(/mnt/script/ovh-api-bash-client.sh --method GET --url "/cloud/project/$OVHSERVICENAME/instance?region=$OVHREGION")
+              code=${Response% *}
+              body=${Response#* }
+
+              if [ $code -ne 200 ]
+              then
+                  echo "api failed, returned $code"
+                  /sbin/killall5
+              fi
+
+              nodeage=$(date -d $(echo $body | jq --arg NODE $NODE '.[] | select(.name | contains($NODE)) | .created' | tr -d '"' ) "+%s") #save nodeage as timestamp
+              #echo "nodeage: $nodeage"
+              kubectl label nodes $NODE OVH_CREATIONTIME="$nodeage" --overwrite=true
+          fi
+          #echo "get new age from label"
+          nodeage=$(kubectl get node $NODE -o json | jq .metadata.labels.OVH_CREATIONTIME | tr -d '"')
+          currenttime=$(date --utc +%s)
+          #deltaS is the number of seconds for how long the node has been running
+          deltaS=$((currenttime-nodeage))
+          #convert to minutes
+          deltaM=$((deltaS/60))
+          #now get mod60
+          Mod_M=$((deltaM % 60))
+
+          echo "$(date): $NODE    deltaM=$deltaM  Mod_M=$Mod_M"
+
+          if [ "$Mod_M" -gt $MAX_MINUTES ]; then
+            echo "Node too close to billing cycle, set annotation"
+            kubectl annotate node $NODE cluster-autoscaler.kubernetes.io/scale-down-disabled=true --overwrite
+          elif [ "$Mod_M" -lt $MIN_MINUTES ]; then
+            echo "Node should be kept, set annotation"
+            kubectl annotate node $NODE cluster-autoscaler.kubernetes.io/scale-down-disabled=true --overwrite
+          else
+            echo "Node should not be kept, remove annotation"
+            kubectl annotate node $NODE cluster-autoscaler.kubernetes.io/scale-down-disabled-
+          fi
+          echo ""
+      done
+    fi
+    sleep $TIME_TO_SLEEP
+    done
+  ovh-api-bash-client.sh: |-
+    #!/usr/bin/env bash
+
+    readonly OVH_CONSUMER_KEY=$OVH_CONSUMER_KEY
+    readonly OVH_APP_KEY=$OVH_APP_KEY
+    readonly OVH_APP_SECRET=$OVH_APP_SECRET
+    readonly LIBS="libs"
+
+    #readonly TARGETS=(CA EU US)
+    readonly TARGETS=(CA)
+
+    declare -A API_URLS
+    API_URLS[CA]="https://ca.api.ovh.com/1.0"
+    #API_URLS[EU]="https://api.ovh.com/1.0"
+    #API_URLS[US]="https://api.ovhcloud.com/1.0"
+
+    declare -A API_CREATE_APP_URLS
+    API_CREATE_APP_URLS[CA]="https://ca.api.ovh.com/createApp/"
+    #API_CREATE_APP_URLS[EU]="https://api.ovh.com/createApp/"
+    #API_CREATE_APP_URLS[US]="https://api.ovhcloud.com/createApp/"
+
+    readonly API_URLS
+    readonly API_CREATE_APP_URLS
+
+    HELP_CMD="$0"
+
+    _echoWarning()
+    {
+      echo >&2 "[WARNING] $*"
+    }
+
+    # join alements of an array with a separator (single char)
+    # usage:
+    # _arrayJoin "|" "${my_array[@]}"
+    #
+    _arrayJoin()
+    {
+        local IFS="$1"
+        shift
+        echo "$*"
+    }
+
+    _StringToLower()
+    {
+      echo "$1" | tr '[:upper:]' '[:lower:]'
+    }
+
+    _StringToUpper()
+    {
+      echo "$1" | tr '[:lower:]' '[:upper:]'
+    }
+
+    # verify if an array contains an item
+    # _in_array "wanted" "${array[@]}"
+    # _in_array "wanted_key" "${!array[@]}"
+    _in_array()
+    {
+        local item wanted
+        wanted="$1"
+        shift
+        for item; do
+            [[ "${item}" == "${wanted}" ]] && return 0
+        done
+        return 1
+    }
+
+    isTargetValid()
+    {
+        if ! _in_array "${TARGET}" "${TARGETS[@]}"; then
+            help "'${TARGET}' is not a valid target, accepted values are: ${TARGETS[*]}"
+            exit 1
+        fi
+    }
+
+
+    updateTime()
+    {
+        # use OVH API's timestamp instead of user's one to bypass misconfigured host.
+        curl -s "${API_URL}/auth/time"
+    }
+
+    # usage:
+    # updateSignData "method" "url" "post_data" "timestamp"
+    # return: print signature
+    updateSignData()
+    {
+        local sig_data
+        local method=$1
+        local url=$2
+        local post_data=$3
+        local timestamp=$4
+
+        sig_data="${OVH_APP_SECRET}+${OVH_CONSUMER_KEY}+${method}+${API_URL}${url}+${post_data}+${timestamp}"
+        echo "\$1\$$(echo -n "${sig_data}" | sha1sum - | cut -d' ' -f1)"
+    }
+
+    help()
+    {
+      # print error message if set
+      [[ -n "$1" ]] && echo -e "Error: $1\\n"
+
+    cat <<EOF
+    Help: possible arguments are:
+      --url <url>             : the API URL to call, for example /domains (default is /me)
+      --method <method>       : the HTTP method to use, for example POST (default is GET)
+      --data <JSON data>      : the data body to send with the request
+      --list-profile          : list available profiles in ~/.ovh-api-bash-client/profile directory
+      --profile <profile>
+                * default : from ~/.ovh-api-bash-client/profile directory
+                * <dir>   : from ~/.ovh-api-bash-client/profile/<dir> directory
+
+    EOF
+    }
+
+    parseArguments()
+    {
+        # an action launched out of this function
+        INIT_KEY_ACTION=
+
+        while [[ $# -gt 0 ]]
+        do
+            case $1 in
+            --data)
+                shift
+                POST_DATA=$1
+                ;;
+            --method)
+                shift
+                METHOD=$1
+                ;;
+            --url)
+                shift
+                URL=$1
+                ;;
+            --target)
+                shift
+                TARGET=$1
+                isTargetValid
+                ;;
+            --help|-h)
+                help
+                exit 0
+                ;;
+            *)
+                help "Unknow parameter $1"
+                exit 0
+                ;;
+            esac
+            shift
+        done
+
+    }
+
+    # usage:
+    # requestNoAuth "method" "url"
+    requestNoAuth()
+    {
+        local method=$1
+        local url=$2
+
+        local timestamp
+        timestamp=$(updateTime)
+
+        curl -s -X "${method}" \
+            --header 'Content-Type:application/json;charset=utf-8' \
+            --header "X-Ovh-Application:${OVH_APP_KEY}" \
+            --header "X-Ovh-Timestamp:${timestamp}" \
+            --data "${POST_DATA}" \
+            "${API_URL}${url}"
+    }
+
+    request()
+    {
+        local response response_status response_content sig timestamp
+
+        timestamp=$(updateTime)
+        sig=$(updateSignData "${METHOD}" "${URL}" "${POST_DATA}" "${timestamp}")
+
+        response=$(curl -s -w '\n%{http_code}\n' -X "${METHOD}" \
+        --header 'Content-Type:application/json;charset=utf-8' \
+        --header "X-Ovh-Application:${OVH_APP_KEY}" \
+        --header "X-Ovh-Timestamp:${timestamp}" \
+        --header "X-Ovh-Signature:${sig}" \
+        --header "X-Ovh-Consumer:${OVH_CONSUMER_KEY}" \
+        --data "${POST_DATA}" \
+        "${API_URL}${URL}")
+
+        response_status=$(echo "${response}" | sed -n '$p')
+        response_content=$(echo "${response}" | sed '$d')
+        echo "${response_status} ${response_content}"
+    }
+
+    getJSONFieldString()
+    {
+        local json field result
+
+        json="$1"
+        field="$2"
+        # shellcheck disable=SC1117
+        result=$(echo "${json}" | "${BASE_PATH}/${LIBS}/JSON.sh" | grep "\[\"${field}\"\]" | sed -r "s/\[\"${field}\"\]\s+(.*)/\1/")
+        echo "${result:1:${#result}-2}"
+    }
+
+
+
+    # ensure OVH App Key an App Secret are defined
+    hasOvhAppKey()
+    {
+        if [[ -z "${OVH_APP_KEY}" ]] && [[ -z "${OVH_APP_SECRET}" ]]; then
+            echo -e "No application is defined for target ${TARGET}, please call to initialize it:\\n${HELP_CMD} --initApp"
+            return 1
+        fi
+        return 0
+    }
+
+    main()
+    {
+        parseArguments "$@"
+
+        # set to default value if empty
+        TARGET=${TARGET:-"CA"}
+        METHOD=${METHOD:-"GET"}
+        URL=${URL:-"/me"}
+        POST_DATA=${POST_DATA:-}
+
+        readonly API_URL="${API_URLS[${TARGET}]}"
+
+        local profileAction="get"
+
+        if [[ -n "${INIT_KEY_ACTION}" ]]; then
+            profileAction="set"
+        fi
+
+        # user want to add An API Key
+        case ${INIT_KEY_ACTION} in
+          AppKey) createApp;;
+          ConsumerKey) createConsumerKey;;
+        esac
+        ## exit after initializing any API Keys
+        [[ -n "${INIT_KEY_ACTION}" ]] && exit 0
+
+        if hasOvhAppKey; then
+          if [[ -z "${OVH_CONSUMER_KEY}" ]]; then
+            echo "No consumer key for target ${TARGET}, please call to initialize it:"
+            echo "${HELP_CMD} --init"
+          else
+            request "${METHOD}" "${URL}"
+          fi
+        fi
+    }
+
+    main "$@"

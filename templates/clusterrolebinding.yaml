@@ -1,0 +1,21 @@
+{{- if .Values.serviceAccount.create -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "nodepool-annotater.fullname" . }}-clusterrolebinding
+  namespace: {{ template "nodepool-annotater.namespace" . }}
+  labels:
+    {{- include "nodepool-annotater.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "nodepool-annotater.fullname" . }}-clusterrole
+subjects:
+- kind: ServiceAccount
+  name: {{ include "nodepool-annotater.serviceAccountName" . }}
+  namespace: {{ template "nodepool-annotater.namespace" . }}
+{{- end }}

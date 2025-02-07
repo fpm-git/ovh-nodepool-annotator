@@ -1,0 +1,82 @@
+{{- $root := . -}} #Need to do this to break out of the context of range
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "nodepool-annotater.fullname" . }}
+  namespace: {{ template "nodepool-annotater.namespace" . }}
+  labels:
+    {{- include "nodepool-annotater.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "nodepool-annotater.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "nodepool-annotater.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "nodepool-annotater.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "-c"]
+          args: 
+            - ./mnt/script/run.sh
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: configmap
+              mountPath: /mnt/script
+          env:
+            {{- range $key, $value := .Values.env }}
+            {{- if $value }}
+            - name: "{{ $key }}"
+              value: |-
+                {{ $value }}
+            {{- end }}
+            {{- end }}
+          envFrom:
+          - secretRef:
+              name: ovh-secret
+              optional: false
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+      volumes:
+      - configMap:
+          defaultMode: 444
+          name: {{ include "nodepool-annotater.fullname" . }}-configmap
+          optional: true
+        name: configmap
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nodepool
+                operator: In
+                values:
+                - {{ .Values.persistantNodepool }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
