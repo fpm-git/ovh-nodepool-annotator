@@ -4,7 +4,7 @@
 
 replicaCount: 1
 image:
-  repository: bitnami/kubectl
+  repository: alpine/kubectl
   pullPolicy: IfNotPresent
   # Overrides the image tag whose default is the chart appVersion.
   tag: "1.23.11" #They removed curl, fix better later
